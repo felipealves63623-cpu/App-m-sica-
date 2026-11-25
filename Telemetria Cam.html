@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Telemetria Cam</title>
+<style>
+:root{color-scheme:dark;--bg:#000;--fg:#f4f4f5;--mut:#a1a1aa;--acc:#22d3ee;--rec:#ef4444;--card:rgba(24,24,27,.85);box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,system-ui,"Segoe UI",sans-serif;overflow:hidden}
+#cv{width:100%;height:100%;object-fit:contain;display:block;background:#000}
+#vid{position:fixed;width:1px;height:1px;opacity:0;pointer-events:none}
+#start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:24px;text-align:center;background:var(--bg)}
+#start h1{margin:0;font-size:26px}
+#start p{margin:0;max-width:420px;color:var(--mut);font-size:14px;line-height:1.5}
+button{font:inherit;color:var(--fg);background:var(--card);border:1px solid #3f3f46;border-radius:999px;padding:12px 18px;font-size:15px}
+button.big{background:var(--acc);color:#001014;border:0;font-weight:700;padding:16px 36px;font-size:18px}
+#bar{position:fixed;left:0;right:0;bottom:0;display:none;gap:8px;justify-content:center;flex-wrap:wrap;padding:10px 10px calc(10px + env(safe-area-inset-bottom,0px))}
+#rec{width:64px;height:64px;padding:0;border:4px solid #fff;background:var(--rec)}
+#rec.on{border-radius:16px}
+#err{color:#fca5a5;font-size:13px;min-height:18px}
+</style>
+</head>
+<body>
+<canvas id="cv" width="1920" height="1080"></canvas>
+<video id="vid" playsinline muted autoplay></video>
+
+<div id="start">
+  <h1>Telemetria Cam</h1>
+  <p>Grava o vídeo da câmera com velocidade, GPS, aceleração, giroscópio, bússola e mais, tudo gravado dentro do vídeo. Monte o iPhone no suporte, de preferência na horizontal, e toque em iniciar. Permita câmera, microfone, localização e movimento.</p>
+  <button class="big" id="go">Iniciar</button>
+  <div id="err"></div>
+</div>
+
+<div id="bar">
+  <button id="inv">Inverter lateral</button>
+  <button id="rec" aria-label="Gravar"></button>
+  <button id="sv" disabled>Salvar vídeo</button>
+  <button id="csv" disabled>CSV</button>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const cv=$('cv'),ctx=cv.getContext('2d'),vid=$('vid');
+const D={spd:null,gpsAcc:null,lat:null,lon:null,alt:null,altAcc:null,hdg:null,comp:null,
+ ax:0,ay:0,az:0,gx:0,gy:0,gz:0,rA:0,rB:0,rG:0,al:0,be:0,ga:0,gAcc:0,bat:null,charging:null};
+let dist=0,maxSpd=0,t0=null,lastPos=null,lastV=null,lastVt=null,spdSum=0,spdN=0,flip=1;
+let rec=null,chunks=[],log=[],blob=null,mime='',trail=[],lastLog=0,recStart=0;
+const f=(v,d=1)=>v==null||isNaN(v)?'--':v.toFixed(d);
+const card=['N','NE','L','SE','S','SO','O','NO'];
+const dir=h=>h==null?'':card[Math.round(h/45)%8];
+const lp=(o,n,a=.35)=>o+(n-o)*a;
+
+function onMotion(e){
+  const a=e.acceleration,g=e.accelerationIncludingGravity,r=e.rotationRate;
+  if(g){D.gx=g.x||0;D.gy=g.y||0;D.gz=g.z||0}
+  const ang=(screen.orientation&&screen.orientation.angle)||0;
+  const src=a&&a.x!=null?a:g;
+  if(src){
+    // câmera traseira aponta para frente: frente = -z do aparelho
+    const lat=(ang===0||ang===180)?(src.x||0):(ang===90?-(src.y||0):(src.y||0));
+    const lon=-(src.z||0),vert=src.y||0;
+    D.ax=lp(D.ax,lat*flip/9.81);D.ay=lp(D.ay,lon/9.81);D.az=lp(D.az,((ang===0||ang===180)?vert:(src.x||0))/9.81);
+    D.gAcc=Math.hypot(src.x||0,src.y||0,src.z||0)/9.81;
+  }
+  if(r){D.rA=r.alpha||0;D.rB=r.beta||0;D.rG=r.gamma||0}
+}
+function onOri(e){D.al=e.alpha||0;D.be=e.beta||0;D.ga=e.gamma||0;
+  if(e.webkitCompassHeading!=null)D.comp=e.webkitCompassHeading;else if(e.alpha!=null)D.comp=(360-e.alpha)%360}
+function onPos(p){
+  const c=p.coords,t=p.timestamp/1000;
+  D.lat=c.latitude;D.lon=c.longitude;D.alt=c.altitude;D.altAcc=c.altitudeAccuracy;D.gpsAcc=c.accuracy;
+  if(c.heading!=null&&!isNaN(c.heading))D.hdg=c.heading;
+  const v=c.speed!=null&&c.speed>=0?c.speed*3.6:null;
+  if(v!=null){
+    if(lastV!=null&&t>lastVt)D.gpsA=(((v-lastV)/3.6)/(t-lastVt))/9.81;
+    lastV=v;lastVt=t;D.spd=v;
+    if(v>maxSpd)maxSpd=v;
+    if(v>2){spdSum+=v;spdN++}
+  }
+  if(lastPos&&c.accuracy<40&&(v||0)>1.5)dist+=hav(lastPos,c);
+  lastPos={latitude:c.latitude,longitude:c.longitude};
+}
+function hav(a,b){const R=6371000,r=Math.PI/180,dl=(b.latitude-a.latitude)*r,dn=(b.longitude-a.longitude)*r;
+  const x=Math.sin(dl/2)**2+Math.cos(a.latitude*r)*Math.cos(b.latitude*r)*Math.sin(dn/2)**2;return 2*R*Math.asin(Math.sqrt(x))}
+
+$('go').onclick=async()=>{
+  const err=$('err');err.textContent='';
+  try{
+    const reqs=[];
+    if(window.DeviceMotionEvent&&DeviceMotionEvent.requestPermission)reqs.push(DeviceMotionEvent.requestPermission());
+    if(window.DeviceOrientationEvent&&DeviceOrientationEvent.requestPermission)reqs.push(DeviceOrientationEvent.requestPermission());
+    const res=await Promise.all(reqs);
+    if(res.includes('denied'))err.textContent='Sensores de movimento negados. Ajuste em Ajustes > Safari.';
+    addEventListener('devicemotion',onMotion);addEventListener('deviceorientation',onOri);
+    const vc={facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:30}};
+    let st;
+    try{st=await navigator.mediaDevices.getUserMedia({video:vc,audio:true})}
+    catch(e){st=await navigator.mediaDevices.getUserMedia({video:vc,audio:false})}
+    vid.srcObject=st;await vid.play();window.stream=st;
+    navigator.geolocation.watchPosition(onPos,e=>{err.textContent='GPS: '+e.message},{enableHighAccuracy:true,maximumAge:0,timeout:20000});
+    try{if(navigator.getBattery){const b=await navigator.getBattery();const u=()=>{D.bat=b.level*100;D.charging=b.charging};u();b.onlevelchange=u;b.onchargingchange=u}}catch(e){}
+    try{if(navigator.wakeLock)await navigator.wakeLock.request('screen')}catch(e){}
+    t0=Date.now();$('start').style.display='none';$('bar').style.display='flex';
+    requestAnimationFrame(draw);
+  }catch(e){err.textContent='Erro: '+e.message+'. Abra o link direto no Safari (HTTPS) e permita os acessos.'}
+};
+$('inv').onclick=()=>{flip*=-1};
+
+function pickMime(){
+  for(const m of ['video/mp4;codecs=avc1,mp4a.40.2','video/mp4','video/webm;codecs=vp9,opus','video/webm'])
+    if(window.MediaRecorder&&MediaRecorder.isTypeSupported(m))return m;
+  return '';
+}
+$('rec').onclick=()=>{
+  if(rec){rec.stop();return}
+  mime=pickMime();chunks=[];log=[];blob=null;
+  const cs=cv.captureStream(30);
+  (window.stream.getAudioTracks()).forEach(t=>cs.addTrack(t));
+  try{rec=new MediaRecorder(cs,mime?{mimeType:mime,videoBitsPerSecond:8e6}:{})}
+  catch(e){$('err').textContent=e.message;return}
+  rec.ondataavailable=e=>e.data.size&&chunks.push(e.data);
+  rec.onstop=()=>{blob=new Blob(chunks,{type:mime||'video/mp4'});rec=null;$('rec').classList.remove('on');$('sv').disabled=false;$('csv').disabled=false};
+  rec.start(1000);recStart=Date.now();$('rec').classList.add('on');$('sv').disabled=true;
+};
+$('sv').onclick=async()=>{
+  if(!blob)return;
+  const ext=blob.type.includes('mp4')?'mp4':'webm',name='telemetria-'+Date.now()+'.'+ext;
+  const file=new File([blob],name,{type:blob.type});
+  if(navigator.canShare&&navigator.canShare({files:[file]})){try{await navigator.share({files:[file]});return}catch(e){if(e.name==='AbortError')return}}
+  dl(blob,name);
+};
+$('csv').onclick=()=>{
+  if(!log.length)return;
+  const h=Object.keys(log[0]).join(',');
+  dl(new Blob([h+'\n'+log.map(r=>Object.values(r).join(',')).join('\n')],{type:'text/csv'}),'telemetria-'+Date.now()+'.csv');
+};
+function dl(b,n){const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=n;document.body.appendChild(a);a.click();a.remove()}
+
+function rr(x,y,w,h,r){ctx.beginPath();ctx.roundRect(x,y,w,h,r);ctx.fillStyle='rgba(0,0,0,.5)';ctx.fill()}
+function tx(s,x,y,sz,col='#fff',al='left',w='600',fam='ui-monospace,Menlo,monospace'){ctx.font=w+' '+sz+'px '+fam;ctx.fillStyle=col;ctx.textAlign=al;ctx.fillText(s,x,y)}
+function fmtT(ms){const s=Math.floor(ms/1000);return String(Math.floor(s/3600)).padStart(2,'0')+':'+String(Math.floor(s/60)%60).padStart(2,'0')+':'+String(s%60).padStart(2,'0')}
+
+function draw(){
+  requestAnimationFrame(draw);
+  if(!vid.videoWidth)return;
+  if(!rec&&(cv.width!==vid.videoWidth||cv.height!==vid.videoHeight)){cv.width=vid.videoWidth;cv.height=vid.videoHeight}
+  const W=cv.width,H=cv.height,k=Math.min(W,H)/1080,now=Date.now();
+  ctx.drawImage(vid,0,0,W,H);
+  const m=28*k;
+  // dados (esquerda superior)
+  const pitch=D.be,roll=D.ga;
+  const rows=[
+    ['LAT',f(D.lat,6)],['LON',f(D.lon,6)],
+    ['ALT',f(D.alt,0)+' m'],['PREC',f(D.gpsAcc,0)+' m'],
+    ['RUMO',f(D.hdg,0)+'° '+dir(D.hdg)],['BUSS',f(D.comp,0)+'° '+dir(D.comp)],
+    ['G LAT',f(D.ax,2)],['G LON',f(D.ay,2)],['G VERT',f(D.az,2)],
+    ['ACEL GPS',f(D.gpsA,2)+' g'],
+    ['GIRO',f(D.rA+0,0)+' '+f(D.rB,0)+' '+f(D.rG,0)+' °/s'],
+    ['PITCH',f(pitch,0)+'°'],['ROLL',f(roll,0)+'°'],
+    ['DIST',f(dist/1000,2)+' km'],['MAX',f(maxSpd,0)+' km/h'],
+    ['MÉD',f(spdN?spdSum/spdN:null,0)+' km/h'],
+    ['BAT',D.bat==null?'n/d':f(D.bat,0)+'%'+(D.charging?' ⚡':'')]
+  ];
+  const lh=31*k,pw=370*k;
+  rr(m,m,pw,rows.length*lh+16*k,12*k);
+  rows.forEach((r,i)=>{const y=m+8*k+(i+1)*lh-8*k;tx(r[0],m+12*k,y,22*k,'#a1a1aa');tx(r[1],m+pw-12*k,y,22*k,'#fff','right')});
+  // topo direita
+  const d=new Date(now);
+  rr(W-m-300*k,m,300*k,rec?110*k:70*k,12*k);
+  tx(d.toLocaleTimeString('pt-BR'),W-m-14*k,m+46*k,38*k,'#fff','right');
+  if(rec){const on=Math.floor(now/500)%2;if(on){ctx.beginPath();ctx.arc(W-m-270*k,m+84*k,10*k,0,7);ctx.fillStyle='#ef4444';ctx.fill()}
+    tx('REC '+fmtT(now-recStart),W-m-14*k,m+92*k,26*k,'#ef4444','right')}
+  // velocidade (inferior esquerda)
+  const sw=360*k,sh=200*k,sy=H-m-sh-(rec||true?70*k:0);
+  rr(m,sy,sw,sh,16*k);
+  tx(D.spd==null?'--':String(Math.round(D.spd)),m+sw/2,sy+135*k,130*k,'#22d3ee','center','800','-apple-system,system-ui,sans-serif');
+  tx('km/h',m+sw/2,sy+180*k,32*k,'#a1a1aa','center','600','-apple-system,system-ui,sans-serif');
+  // G-meter (inferior direita)
+  const R=110*k,cx=W-m-R-10*k,cy=H-m-R-80*k,gmax=1.5;
+  ctx.beginPath();ctx.arc(cx,cy,R+10*k,0,7);ctx.fillStyle='rgba(0,0,0,.5)';ctx.fill();
+  ctx.strokeStyle='rgba(255,255,255,.4)';ctx.lineWidth=2*k;
+  [.33,.66,1].forEach(q=>{ctx.beginPath();ctx.arc(cx,cy,R*q,0,7);ctx.stroke()});
+  ctx.beginPath();ctx.moveTo(cx-R,cy);ctx.lineTo(cx+R,cy);ctx.moveTo(cx,cy-R);ctx.lineTo(cx,cy+R);ctx.stroke();
+  const px=cx+Math.max(-1,Math.min(1,D.ax/gmax))*R,py=cy-Math.max(-1,Math.min(1,D.ay/gmax))*R;
+  trail.push([px,py]);if(trail.length>40)trail.shift();
+  trail.forEach((p,i)=>{ctx.beginPath();ctx.arc(p[0],p[1],(3+i*.12)*k,0,7);ctx.fillStyle='rgba(34,211,238,'+(i/60)+')';ctx.fill()});
+  ctx.beginPath();ctx.arc(px,py,11*k,0,7);ctx.fillStyle='#22d3ee';ctx.fill();
+  tx(f(Math.hypot(D.ax,D.ay),2)+' G',cx,cy+R+40*k,26*k,'#fff','center');
+  // log
+  if(rec&&now-lastLog>=100){lastLog=now;
+    log.push({t_ms:now-recStart,iso:new Date(now).toISOString(),lat:D.lat,lon:D.lon,alt:D.alt,gps_acc:D.gpsAcc,speed_kmh:D.spd,heading:D.hdg,compass:D.comp,
+      g_lat:D.ax.toFixed(3),g_lon:D.ay.toFixed(3),g_vert:D.az.toFixed(3),gps_accel_g:D.gpsA??'',rot_alpha:D.rA,rot_beta:D.rB,rot_gamma:D.rG,
+      pitch:D.be,roll:D.ga,yaw:D.al,dist_m:dist.toFixed(1),battery:D.bat??''})}
+}
+</script>
+</body>
+</html>
